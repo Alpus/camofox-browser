@@ -48,10 +48,12 @@
   },
   "scripts": {
     "start": "node server.js",
-    "test": "jest --runInBand --forceExit",
+    "test": "jest --runInBand --forceExit tests/unit",
+    "test:integration": "jest --runInBand --forceExit tests/integration",
     "test:e2e": "jest --runInBand --forceExit tests/e2e",
     "test:live": "RUN_LIVE_TESTS=1 jest --runInBand --forceExit tests/live",
     "test:debug": "DEBUG_SERVER=1 jest --runInBand --forceExit",
+    "test:all": "jest --runInBand --forceExit",
     "postinstall": "npx camoufox-js fetch || true"
   },
   "dependencies": {
