@@ -673,7 +673,7 @@ app.post('/tabs/:tabId/click', async (req, res) => {
   const tabId = req.params.tabId;
   
   try {
-    const { userId, ref, selector } = req.body;
+    const { userId, ref, selector, x, y } = req.body;
     const session = sessions.get(normalizeUserId(userId));
     const found = session && findTab(session, tabId);
     if (!found) return res.status(404).json({ error: 'Tab not found' });
@@ -681,8 +681,27 @@ app.post('/tabs/:tabId/click', async (req, res) => {
     const { tabState } = found;
     tabState.toolCalls++;
     
-    if (!ref && !selector) {
-      return res.status(400).json({ error: 'ref or selector required' });
+    if (!ref && !selector && (x == null || y == null)) {
+      return res.status(400).json({ error: 'ref, selector, or x/y coordinates required' });
+    }
+    
+    // Direct coordinate click (no element lookup needed)
+    if (x != null && y != null && !ref && !selector) {
+      const result = await withTabLock(tabId, async () => {
+        await tabState.page.mouse.move(x, y);
+        await tabState.page.waitForTimeout(50);
+        await tabState.page.mouse.down();
+        await tabState.page.waitForTimeout(50);
+        await tabState.page.mouse.up();
+        log('info', `coordinate click at (${x}, ${y})`);
+        
+        await tabState.page.waitForTimeout(500);
+        tabState.refs = await buildRefs(tabState.page);
+        const newUrl = tabState.page.url();
+        tabState.visitedUrls.add(newUrl);
+        return { ok: true, url: newUrl };
+      });
+      return res.json(result);
     }
     
     const result = await withTabLock(tabId, async () => {
@@ -838,6 +857,154 @@ app.post('/tabs/:tabId/scroll', async (req, res) => {
   } catch (err) {
     log('error', 'scroll failed', { reqId: req.reqId, error: err.message });
     res.status(500).json({ error: safeError(err) });
+  }
+});
+
+// Evaluate — execute JS in page
+app.post('/tabs/:tabId/evaluate', async (req, res) => {
+  const tabId = req.params.tabId;
+  try {
+    const { userId, expression, frameSelector } = req.body;
+    const session = sessions.get(normalizeUserId(userId));
+    const found = session && findTab(session, tabId);
+    if (!found) return res.status(404).json({ error: 'Tab not found' });
+
+    const { tabState } = found;
+    tabState.toolCalls++;
+
+    const result = await withTabLock(tabId, async () => {
+      if (frameSelector) {
+        const frame = tabState.page.frameLocator(frameSelector);
+        const result = await frame.locator('body').evaluate((body, expr) => {
+          return eval(expr);
+        }, expression);
+        return { ok: true, result };
+      }
+      const evalResult = await tabState.page.evaluate(expression);
+      return { ok: true, result: evalResult };
+    });
+
+    log('info', 'evaluate', { reqId: req.reqId, tabId });
+    res.json(result);
+  } catch (err) {
+    log('error', 'evaluate failed', { reqId: req.reqId, tabId, error: err.message });
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Aim — crosshair overlay for coordinate verification
+app.get('/tabs/:tabId/aim', async (req, res) => {
+  const tabId = req.params.tabId;
+  try {
+    const userId = req.query.userId;
+    const session = sessions.get(normalizeUserId(userId));
+    const found = session && findTab(session, tabId);
+    if (!found) return res.status(404).json({ error: 'Tab not found' });
+
+    const { tabState } = found;
+    const xValues = String(req.query.x || '').split(',').map(Number).filter(n => !isNaN(n));
+    const yValues = String(req.query.y || '').split(',').map(Number).filter(n => !isNaN(n));
+
+    if (xValues.length === 0 || yValues.length === 0 || xValues.length !== yValues.length) {
+      return res.status(400).json({ error: 'x and y required (comma-separated for multiple points)' });
+    }
+
+    const result = await withTabLock(tabId, async () => {
+      const screenshotBuf = await tabState.page.screenshot({ type: 'png' });
+      const b64 = screenshotBuf.toString('base64');
+      const points = xValues.map((x, i) => ({ x, y: yValues[i] }));
+
+      const markedB64 = await tabState.page.evaluate(({ imgBase64, points }) => {
+        return new Promise((resolve) => {
+          const img = new Image();
+          img.onload = () => {
+            const canvas = document.createElement('canvas');
+            canvas.width = img.width;
+            canvas.height = img.height;
+            const ctx = canvas.getContext('2d');
+            ctx.drawImage(img, 0, 0);
+
+            points.forEach(({ x, y }, idx) => {
+              const size = 20;
+              ctx.strokeStyle = '#FF0000';
+              ctx.lineWidth = 3;
+              ctx.beginPath(); ctx.moveTo(x - size, y); ctx.lineTo(x + size, y); ctx.stroke();
+              ctx.beginPath(); ctx.moveTo(x, y - size); ctx.lineTo(x, y + size); ctx.stroke();
+              ctx.beginPath(); ctx.arc(x, y, size * 0.7, 0, Math.PI * 2); ctx.stroke();
+              if (points.length > 1) {
+                ctx.font = 'bold 14px Arial'; ctx.fillStyle = '#FF0000';
+                ctx.fillText(String(idx + 1), x + size + 4, y + 5);
+              }
+              ctx.font = '12px Arial'; ctx.fillStyle = '#FF0000';
+              ctx.fillText(`(${x},${y})`, x + size + (points.length > 1 ? 18 : 4), y + 5);
+            });
+
+            resolve(canvas.toDataURL('image/png').split(',')[1]);
+          };
+          img.src = 'data:image/png;base64,' + imgBase64;
+        });
+      }, { imgBase64: b64, points });
+
+      return Buffer.from(markedB64, 'base64');
+    });
+
+    res.set('Content-Type', 'image/png');
+    res.send(result);
+  } catch (err) {
+    log('error', 'aim failed', { reqId: req.reqId, tabId, error: err.message });
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Crop — zoomed region extraction
+app.get('/tabs/:tabId/crop', async (req, res) => {
+  const tabId = req.params.tabId;
+  try {
+    const userId = req.query.userId;
+    const session = sessions.get(normalizeUserId(userId));
+    const found = session && findTab(session, tabId);
+    if (!found) return res.status(404).json({ error: 'Tab not found' });
+
+    const { tabState } = found;
+    const x = parseInt(req.query.x);
+    const y = parseInt(req.query.y);
+    const w = parseInt(req.query.w);
+    const h = parseInt(req.query.h);
+    const scale = parseFloat(req.query.scale) || 2;
+
+    if (isNaN(x) || isNaN(y) || isNaN(w) || isNaN(h)) {
+      return res.status(400).json({ error: 'x, y, w, h required (region to crop)' });
+    }
+
+    const result = await withTabLock(tabId, async () => {
+      const screenshotBuf = await tabState.page.screenshot({ type: 'png' });
+      const b64 = screenshotBuf.toString('base64');
+
+      const croppedB64 = await tabState.page.evaluate(({ imgBase64, x, y, w, h, scale }) => {
+        return new Promise((resolve) => {
+          const img = new Image();
+          img.onload = () => {
+            const canvas = document.createElement('canvas');
+            canvas.width = Math.round(w * scale);
+            canvas.height = Math.round(h * scale);
+            const ctx = canvas.getContext('2d');
+            ctx.imageSmoothingEnabled = true;
+            ctx.imageSmoothingQuality = 'high';
+            ctx.drawImage(img, x, y, w, h, 0, 0, canvas.width, canvas.height);
+            resolve(canvas.toDataURL('image/png').split(',')[1]);
+          };
+          img.src = 'data:image/png;base64,' + imgBase64;
+        });
+      }, { imgBase64: b64, x, y, w, h, scale });
+
+      return Buffer.from(croppedB64, 'base64');
+    });
+
+    res.set('Content-Type', 'image/png');
+    res.send(result);
+  } catch (err) {
+    log('error', 'crop failed', { reqId: req.reqId, tabId, error: err.message });
+    res.status(500).json({ error: err.message });
   }
 });
 
